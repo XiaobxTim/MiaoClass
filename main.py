@@ -7,9 +7,9 @@ main.py 南科大TIS喵课助手
 @UpdateDate 2024-9-9
 """
 
-import _thread
 import time
 import os
+import threading
 from getpass import getpass
 from json import loads, dumps
 from re import findall
@@ -44,10 +44,94 @@ head = {
 COURSE_TYPE = {'bxxk': "通识必修选课", 'xxxk': "通识选修选课", "kzyxk": '培养方案内课程',
                "zynknjxk": '非培养方案内课程', "cxxk": '重修选课', "jhnxk": '计划内选课新生'}
 
-TIMEOUT = 1.2 # 线程喵课间隔
+# 2024 年秋季起，选课请求的最小间隔约为 1500ms。
+# 留出网络波动余量，程序强制所有选课线程共享至少 1600ms 的全局间隔。
+# 如需调大，可设置环境变量 TIS_REQUEST_INTERVAL_MS；低于 1600 的值不会生效。
+MIN_REQUEST_INTERVAL_MS = max(
+    1600,
+    int(os.environ.get("TIS_REQUEST_INTERVAL_MS", "1600"))
+)
+MIN_REQUEST_INTERVAL = MIN_REQUEST_INTERVAL_MS / 1000.0
+HTTP_TIMEOUT = (5, 15)  # 连接超时、响应超时
+
+_request_lock = threading.Lock()
+_last_request_started_at = 0.0
+_backoff_until = 0.0
+_rate_limit_count = 0
 
 course_list = []  # 需要喵的课程队列
 # 由于Tis的新限制，逻辑改为同时只选一门课
+
+
+def rate_limited_submit(data):
+    """串行发送选课请求，并保证全局请求间隔不小于配置值。
+
+    锁会覆盖等待和网络请求，因此即使以后重新引入多线程，也不会出现
+    多个请求同时发出、各线程分别 sleep 却仍触发服务端限流的情况。
+    """
+    global _last_request_started_at, _backoff_until, _rate_limit_count
+
+    with _request_lock:
+        now = time.monotonic()
+        earliest_start = max(
+            _last_request_started_at + MIN_REQUEST_INTERVAL,
+            _backoff_until
+        )
+        wait_seconds = earliest_start - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        _last_request_started_at = time.monotonic()
+        try:
+            response = requests.post(
+                'https://tis.sustech.edu.cn/Xsxk/addGouwuche',
+                data=data,
+                headers=head,
+                verify=False,
+                timeout=HTTP_TIMEOUT
+            )
+        except requests.RequestException:
+            # 网络异常后至少暂停 5 秒，避免故障期间持续请求。
+            _backoff_until = time.monotonic() + 5
+            raise
+
+        response_text = response.text
+        is_rate_limited = (
+            response.status_code in {403, 429}
+            or "频繁" in response_text
+            or "过快" in response_text
+        )
+
+        if is_rate_limited:
+            _rate_limit_count += 1
+            retry_after = response.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                backoff_seconds = max(int(retry_after), 5)
+            else:
+                backoff_seconds = min(5 * (2 ** (_rate_limit_count - 1)), 60)
+            _backoff_until = time.monotonic() + backoff_seconds
+            print(
+                ERROR + f"检测到访问频率限制，将暂停 {backoff_seconds} 秒",
+                flush=True
+            )
+        elif response.status_code >= 500:
+            _backoff_until = time.monotonic() + 5
+            print(ERROR + "TIS 服务暂时异常，将至少暂停 5 秒", flush=True)
+        else:
+            _rate_limit_count = 0
+
+        return response
+
+
+def response_message(response):
+    """尽量从 TIS 响应中提取可读消息，避免非 JSON 响应导致程序崩溃。"""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("message"):
+            return str(payload["message"])
+    except ValueError:
+        pass
+    return response.text.strip()[:200] or f"HTTP {response.status_code}"
 
 def load_course():
     """ 用于加载本地要喵的课程
@@ -173,19 +257,24 @@ def submit(semester_data, loop=3):
             "p_id": c_id,  # 课程id
             "p_sfxsgwckb": 1,  # 固定
         }
-        req = requests.post('https://tis.sustech.edu.cn/Xsxk/addGouwuche', data=data, headers=head, verify=False)
-        res = loads(req.text)['message']
-        if "成功" in req.text:
+        try:
+            req = rate_limited_submit(data)
+        except requests.RequestException as ex:
+            print(ERROR + f"选课请求失败：{ex}", flush=True)
+            continue
+        res = response_message(req)
+        is_success = "成功" in req.text
+        should_skip = any(x in req.text for x in ["冲突", "已选", "已满"])
+        if is_success:
             print("[\x1b[0;34m{}\x1b[0m]".format("=" * 50), flush=True)
             print("[\x1b[0;34m█\x1b[0m]\t\t\t" + res, flush=True)
             print("[\x1b[0;34m{}\x1b[0m]".format("=" * 50), flush=True)
-            course_list.pop(0)
         else:
             print("[\x1b[0;30m-\x1b[0m]\t\t\t" + res, flush=True)
-        if any(map(lambda x: x in req.text, ["冲突", "已选", "已满"])):
+        if should_skip:
             print(f"[\x1b[0;31m!\x1b[0m] ({c_name})因为({res})跳过", flush=True)
+        if is_success or should_skip:
             course_list.pop(0)
-        time.sleep(TIMEOUT)
         
         
 def submit_sequential(semester_data):
@@ -207,19 +296,24 @@ def submit_sequential(semester_data):
                 "p_id": c_id,  # 课程id
                 "p_sfxsgwckb": 1,  # 固定
             }
-            req = requests.post('https://tis.sustech.edu.cn/Xsxk/addGouwuche', data=data, headers=head, verify=False)
-            res = loads(req.text)['message']
-            if "成功" in req.text:
+            try:
+                req = rate_limited_submit(data)
+            except requests.RequestException as ex:
+                print(ERROR + f"选课请求失败：{ex}", flush=True)
+                continue
+            res = response_message(req)
+            is_success = "成功" in req.text
+            should_skip = any(x in req.text for x in ["冲突", "已选", "已满"])
+            if is_success:
                 print("[\x1b[0;34m{}\x1b[0m]".format("=" * 50), flush=True)
                 print("[\x1b[0;34m█\x1b[0m]\t\t\t" + res, flush=True)
                 print("[\x1b[0;34m{}\x1b[0m]".format("=" * 50), flush=True)
-                course_list.remove(course)
             else:
                 print("[\x1b[0;30m-\x1b[0m]\t\t\t" + res, flush=True)
-            if any(map(lambda x: x in req.text, ["冲突", "已选", "已满"])):
+            if should_skip:
                 print(f"[\x1b[0;31m!\x1b[0m] ({c_name})因为({res})跳过", flush=True)
+            if is_success or should_skip:
                 course_list.remove(course)
-            time.sleep(TIMEOUT)
 
 
 def exit():
@@ -233,11 +327,13 @@ if __name__ == '__main__':
     course_name_list = load_course()  # 读取本地待喵的课程
     # 下面是CAS登录
     route, jsessionid = "", ""
+    has_saved_user_info = False
     if os.path.exists(USER_INFO_PATH): # 如果有保存的用户信息，尝试从文件自动登录
         try:
             with open(USER_INFO_PATH, "r", encoding="utf8") as f:
                 lines = f.read().splitlines()
                 if len(lines) >= 2:
+                    has_saved_user_info = True
                     user_name, pass_word = lines[0], lines[1]
                     route, jsessionid = cas_login(user_name, pass_word)
         except Exception as e:
@@ -251,11 +347,12 @@ if __name__ == '__main__':
         route, jsessionid = cas_login(user_name, pass_word)
         if route == "" or jsessionid == "":
             print(FAIL + "请重试...")
-        else: # 登录成功后询问保存
+        elif not has_saved_user_info: # 仅首次手动登录时询问保存，已有信息不重复询问
             s = input(INFO + "是否保存用户信息（y/N）？")
             if s.lower() in {"y", "yes"}:
                 with open(USER_INFO_PATH, "w", encoding="utf8") as f:
                     f.write(f"{user_name}\n{pass_word}")
+                has_saved_user_info = True
     head['cookie'] = f'route={route}; JSESSIONID={jsessionid};'
     # 下面先获取当前的学期
     print(INFO + "从服务器获取当前喵课时间...")
@@ -291,25 +388,31 @@ if __name__ == '__main__':
         if mode == "1":
             print(INFO + "当前模式: 优先按照输入课程顺序喵课")
             while course_list:
-                if input(STAR + "按一下回车喵三次，多按同时喵多次，任意字符跳过当前课程\n"):
+                if input(
+                    STAR + f"按一下回车依次喵三次（全局间隔至少 {MIN_REQUEST_INTERVAL_MS}ms），"
+                    "任意字符跳过当前课程\n"
+                ):
                     course_list.pop(0)
                     if not course_list:
                         print(SUCCESS + "⌯'ㅅ'⌯所有课程已喵完，再见😾")
                         exec("os._exit(0)")
                 try:
-                    _thread.start_new_thread(submit, (semester_info, 3))
+                    submit(semester_info, 3)
                 except Exception as e:
-                    print(f"[{e}] 线程异常")
+                    print(f"[{e}] 请求异常")
         
         if mode == "2":
             print(INFO + "当前模式: 所有课程循环喵课")
             while course_list:
-                if input(STAR + "按一下回车对所有课程喵一次，多按同时喵多次，任意字符退出\n"):
+                if input(
+                    STAR + f"按一下回车依次对所有课程喵一次（全局间隔至少 {MIN_REQUEST_INTERVAL_MS}ms），"
+                    "任意字符退出\n"
+                ):
                     exit()
                 try:
-                    _thread.start_new_thread(submit_sequential, (semester_info,))
+                    submit_sequential(semester_info)
                 except Exception as e:
-                    print(f"[{e}] 线程异常")
+                    print(f"[{e}] 请求异常")
         
         if mode == "0":
             exit()

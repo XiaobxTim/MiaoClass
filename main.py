@@ -265,20 +265,11 @@ def cas_login(sid, pwd):
 def getinfo(semester_data):
     """ 用于向tis请求当前学期的课程ID，得到的ID将用于选课的请求
     输入当前学期的日期信息，返回的json包括了课程名和内部的ID """
-    if os.path.exists(COURSE_INFO_PATH) and os.path.isfile(COURSE_INFO_PATH):
-        print(INFO + f"读取本地缓存的课程信息，如果需要更新请删除{COURSE_INFO_PATH}文件")
-        with open(COURSE_INFO_PATH, "r", encoding="utf8") as f:
-            cached_course_list = f.readlines()
-        try:
-            cached_time = cached_course_list[0].strip()
-            if cached_time == semester_data['p_xnxq']:
-                _course_info = loads(cached_course_list[1])
-                print(SUCCESS + f"课程信息读取完毕，共读取{str(len(_course_info))}门课程信息\n")
-                return _course_info
-            else:
-                print(INFO + "缓存文件已过期，重新获取课程信息")
-        except Exception as ex:
-            print(ERROR + f"缓存文件损坏，重新获取课程信息，{ex}")
+    try:
+        os.remove(COURSE_INFO_PATH)
+        print(INFO + f"已删除旧课程缓存 {COURSE_INFO_PATH}，本次重新下载")
+    except FileNotFoundError:
+        pass
     print(INFO + "从服务器下载课程信息，请稍等...")
     _course_info = {}
     for c_type in COURSE_TYPE.keys():
@@ -293,17 +284,47 @@ def getinfo(semester_data):
             "pageSize": 1000  # 每学期总共开课在1000左右，所以单分类可以包括学期的全部课程
         }
         print("[\x1b[0;36m*\x1b[0m] " + f"获取 {COURSE_TYPE[c_type]} 列表...")
-        req = requests.post('https://tis.sustech.edu.cn/Xsxk/queryKxrw', data=data, headers=head, verify=False)
-        raw_class_data = loads(req.text)
-        if raw_class_data.get('kxrwList'):
-            for i in raw_class_data['kxrwList']['list']:
-                _course_info[i['rwmc']] = (i['id'], c_type)
+        count = 0
+        while True:
+            for attempt in range(3):
+                time.sleep(max(MIN_REQUEST_INTERVAL, 5 if attempt else 0))
+                try:
+                    req = requests.post(
+                        'https://tis.sustech.edu.cn/Xsxk/queryKxrw', data=data,
+                        headers=head, verify=False, timeout=HTTP_TIMEOUT)
+                    req.raise_for_status()
+                    payload = req.json()
+                    page = payload.get('kxrwList') if isinstance(payload, dict) else None
+                    if not isinstance(page, dict) or not isinstance(page.get('list'), list):
+                        raise ValueError('响应缺少 kxrwList.list，可能是登录失效、限流或接口返回错误')
+                    rows = page['list']
+                    if any(not isinstance(row, dict) or not row.get('rwmc')
+                           or not row.get('id') for row in rows):
+                        raise ValueError('课程记录缺少名称或ID')
+                    pages = int(page.get('pages') or 0)
+                    total = int(page.get('total') or 0)
+                    break
+                except (requests.RequestException, ValueError, TypeError) as ex:
+                    status = req.status_code if isinstance(ex, ValueError) else '请求失败'
+                    print(ERROR + f"{COURSE_TYPE[c_type]} 第{data['pageNum']}页读取失败"
+                          f"（{type(ex).__name__}，{status}），尝试 {attempt + 1}/3")
+                    if attempt == 2:
+                        raise RuntimeError(f"{COURSE_TYPE[c_type]} 下载失败，未保存不完整课程缓存") from None
+            for row in rows:
+                _course_info[row['rwmc']] = (row['id'], c_type)
+            count += len(rows)
+            more = (data['pageNum'] < pages or count < total
+                    or (not pages and not total and len(rows) == data['pageSize']))
+            if not more:
+                break
+            if not rows:
+                raise RuntimeError(f"{COURSE_TYPE[c_type]} 分页数据不完整，未保存课程缓存")
+            data['pageNum'] += 1
+        print(INFO + f"{COURSE_TYPE[c_type]}：{count} 门")
     print(SUCCESS + f"课程信息读取完毕，共读取{str(len(_course_info))}门课程信息")
-    s = input(INFO + "是否保存读取的课程信息（y/N）？")
-    if s in "yY":
-        with open(COURSE_INFO_PATH, "w", encoding="utf8") as f:
-            f.write(str(semester_data['p_xnxq']) + "\n")
-            f.write(dumps(_course_info, ensure_ascii=False))
+    with open(COURSE_INFO_PATH, "w", encoding="utf8") as f:
+        f.write(str(semester_data['p_xnxq']) + "\n")
+        f.write(dumps(_course_info, ensure_ascii=False))
     return _course_info
 
 
@@ -431,13 +452,21 @@ if __name__ == '__main__':
                     f"{['', '秋季', '春季', '小'][int(semester_info['p_xq'])]}学期")
     # 然后获取本学期全部课程信息
     print(INFO + "读取课程信息...")
-    course_info = getinfo(semester_info)
+    try:
+        course_info = getinfo(semester_info)
+    except (RuntimeError, OSError) as ex:
+        print(ERROR + str(ex))
+        sys.exit(1)
     # 分析要喵课程的ID
     for name in course_name_list:
-        name = name.strip()
+        name = name.lstrip('\ufeff').strip()
+        if not name:
+            continue
         if name in course_info.keys():
             course_id, course_type = course_info[name]
             course_list.append([course_id, course_type, name])
+        else:
+            print(FAIL + f"本次服务器课程列表中未找到：{name}；请核对上方分类数量和网页可选课程")
     print("[\x1b[0;34m{}\x1b[0m]".format("=" * 25))
     for course in course_list:
         print(f"{COURSE_TYPE[course[1]]} : {course[2]}\t\tID为: {course[0]}")

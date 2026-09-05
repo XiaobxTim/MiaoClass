@@ -12,7 +12,9 @@ import os
 import threading
 from getpass import getpass
 from json import loads, dumps
-from re import findall
+from html.parser import HTMLParser
+from http.cookies import SimpleCookie
+from urllib.parse import urljoin, urlparse
 
 import requests
 from colorama import init
@@ -156,41 +158,108 @@ def load_course():
     return courses
 
 
+class _LoginFormParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.execution = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "input" and attrs.get("name") == "execution":
+            self.execution = attrs.get("value") or ""
+
+
 def cas_login(sid, pwd):
-    """ 用于和南科大CAS认证交互，拿到tis的有效cookie
-    输入用于CAS登录的用户名密码，输出tis需要的全部cookie内容(返回头Set-Cookie段的route和jsessionid)
-    我的requests的session不吃CAS重定向给到的cookie，不知道是代码哪里的问题，所以就手动拿了 """
+    """收集 TIS 的 SESSION 或旧版 JSESSIONID；返回 route 和会话值。"""
+    login_url = "https://cas.sustech.edu.cn/cas/login?service=https%3A%2F%2Ftis.sustech.edu.cn%2Fcas"
+    tis_url = "https://tis.sustech.edu.cn/Xsxk/queryXkdqXnxq"
+    # 避免将之前的 TIS Cookie 手动发送给 CAS。
+    headers = {k: v for k, v in head.items() if k.lower() != "cookie"}
+    phase = "获取CAS登录页"
+    trace = []
+    session = None
+    completed = False
+
+    def record_response(response, **kwargs):
+        # 仅记录固定页面路径，省略查询参数及可能含会话标识的未知路径。
+        parsed = urlparse(response.url)
+        path = parsed.path
+        if path not in {"/", "/cas", "/cas/login", "/login", "/login.jsp",
+                        "/index", "/index.html", "/home"}:
+            path = "/<其他路径已省略>"
+        trace.append(f"{phase}: HTTP {response.status_code} {parsed.hostname}{path}")
+
     print(INFO + "测试CAS链接...")
-    try:  # Login 服务的CAS链接有时候会变
-        login_url = "https://cas.sustech.edu.cn/cas/login?service=https%3A%2F%2Ftis.sustech.edu.cn%2Fcas"
-        req = requests.get(login_url, headers=head, verify=False)
-        assert (req.status_code == 200)
-        print(SUCCESS + "成功连接到CAS...")
-    except Exception as ex:
-        print(ERROR + f"不能访问CAS, 请检查您的网络连接状态 ({ex})")
+    try:
+        with requests.Session() as session:
+            session.headers.update(headers)
+            session.hooks['response'].append(record_response)
+            req = session.get(login_url, verify=False, timeout=HTTP_TIMEOUT)
+            req.raise_for_status()
+            parser = _LoginFormParser()
+            parser.feed(req.text)
+            if not parser.execution:
+                print(ERROR + "CAS登录页面缺少 execution 字段，请检查服务状态或登录页面是否变化")
+                return "", ""
+            print(SUCCESS + "成功连接到CAS...")
+            print(INFO + "登录中...")
+            phase = "提交CAS登录表单"
+            req = session.post(
+                login_url,
+                data={'username': sid, 'password': pwd,
+                      'execution': parser.execution, '_eventId': 'submit',
+                      'geolocation': ''},
+                allow_redirects=False, verify=False, timeout=HTTP_TIMEOUT
+            )
+            req.raise_for_status()
+            location = req.headers.get("Location")
+            if not req.is_redirect or not location:
+                print(ERROR + "CAS未返回登录跳转，请检查账号密码或是否需要额外验证")
+                return "", ""
+            phase = "跟随登录跳转至TIS"
+            req = session.get(urljoin(req.url, location),
+                              verify=False, timeout=HTTP_TIMEOUT)
+            req.raise_for_status()
+            if urlparse(req.url).hostname != "tis.sustech.edu.cn":
+                print(ERROR + "登录跳转未到达TIS，可能需要额外认证或TIS未接受登录票据")
+                return "", ""
+            # 按目标域名、路径与 Secure 属性选择 Cookie，避免误取 CAS 的同名值。
+            prepared = session.prepare_request(requests.Request("POST", tis_url))
+            cookie_header = prepared.headers.get("Cookie", "")
+            cookies = SimpleCookie()
+            cookies.load(cookie_header)
+            session_cookie = next(
+                (cookies[name] for name in ("SESSION", "JSESSIONID")
+                 if name in cookies and cookies[name].value), None
+            )
+            if session_cookie is None:
+                print(ERROR + f"TIS未返回可用的会话Cookie（SESSION/JSESSIONID，HTTP {req.status_code}，"
+                      f"跳转 {len(req.history)} 次），需要核对实际认证方式")
+                return "", ""
+            route = cookies.get("route")
+            head['cookie'] = cookie_header
+            completed = True
+            print(SUCCESS + "已获取TIS会话，登录完成")
+            return route.value if route else "", session_cookie.value
+    except requests.RequestException as ex:
+        # 异常文本可能含带 ticket 的 URL，不能直接打印。
+        status = ex.response.status_code if ex.response is not None else "无响应"
+        print(ERROR + f"{phase}失败（{type(ex).__name__}，HTTP {status}）")
         return "", ""
-    print(INFO + "登录中...")
-    data = {  # execution大概是CAS中前端session id之类的东西
-        'username': sid,
-        'password': pwd,
-        'execution': str(req.text).split('''name="execution" value="''')[1].split('"')[0],
-        '_eventId': 'submit',
-        'geolocation': ''  # 新字段
-    }
-    while True:
-        req = requests.post(login_url, data=data, allow_redirects=False, headers=head, verify=False)
-        if req.status_code == 500:
-            print(ERROR + "CAS服务出错，重试中")
-        break
-    if "Location" in req.headers.keys():
-        print(SUCCESS + "登录成功")
-    else:
-        print(ERROR + "用户名或密码错误，请检查")
-        return "", ""
-    req = requests.get(req.headers["Location"], allow_redirects=False, headers=head, verify=False)
-    _route = findall('route=(.+?);', req.headers["Set-Cookie"])[0]
-    _jsessionid = findall('JSESSIONID=(.+?);', req.headers["Set-Cookie"])[0]
-    return _route, _jsessionid
+    finally:
+        if not completed:
+            for entry in trace:
+                print(INFO + "[登录诊断] " + entry)
+            if session is not None:
+                names = sorted({f"{cookie.name} @ {cookie.domain}"
+                                for cookie in session.cookies})
+                print(INFO + "[登录诊断] 已保存Cookie名称及域名: "
+                      + (", ".join(names) or "无"))
+                prepared = session.prepare_request(requests.Request("POST", tis_url))
+                applicable = SimpleCookie()
+                applicable.load(prepared.headers.get("Cookie", ""))
+                print(INFO + "[登录诊断] 可发送给TIS接口的Cookie名称: "
+                      + (", ".join(sorted(applicable)) or "无"))
 
 
 def getinfo(semester_data):
@@ -326,7 +395,7 @@ if __name__ == '__main__':
     init(autoreset=True)  # 某窗口系统的优质终端并不直接支持如下转义彩色字符，所以需要一些库来帮忙
     course_name_list = load_course()  # 读取本地待喵的课程
     # 下面是CAS登录
-    route, jsessionid = "", ""
+    route, session_id = "", ""
     has_saved_user_info = False
     if os.path.exists(USER_INFO_PATH): # 如果有保存的用户信息，尝试从文件自动登录
         try:
@@ -335,17 +404,17 @@ if __name__ == '__main__':
                 if len(lines) >= 2:
                     has_saved_user_info = True
                     user_name, pass_word = lines[0], lines[1]
-                    route, jsessionid = cas_login(user_name, pass_word)
+                    route, session_id = cas_login(user_name, pass_word)
         except Exception as e:
             print(FAIL + f"自动登录出现异常: {e}")
-        if route == "" or jsessionid == "":
+        if session_id == "":
             print(FAIL + "自动登录失败，需要手动登录")
 
-    while route == "" or jsessionid == "":
+    while session_id == "":
         user_name = input("请输入您的学号：")  # getpass在PyCharm里不能正常工作，请改为input或写死
         pass_word = getpass("请输入CAS密码（密码不显示，输入完按回车即可）：")
-        route, jsessionid = cas_login(user_name, pass_word)
-        if route == "" or jsessionid == "":
+        route, session_id = cas_login(user_name, pass_word)
+        if session_id == "":
             print(FAIL + "请重试...")
         elif not has_saved_user_info: # 仅首次手动登录时询问保存，已有信息不重复询问
             s = input(INFO + "是否保存用户信息（y/N）？")
@@ -353,7 +422,6 @@ if __name__ == '__main__':
                 with open(USER_INFO_PATH, "w", encoding="utf8") as f:
                     f.write(f"{user_name}\n{pass_word}")
                 has_saved_user_info = True
-    head['cookie'] = f'route={route}; JSESSIONID={jsessionid};'
     # 下面先获取当前的学期
     print(INFO + "从服务器获取当前喵课时间...")
     semester_info = loads(
